@@ -2,31 +2,17 @@
 
 [![make.fun](https://make.fun/badge/food-picture-01)](https://make.fun/c/food-picture-01)
 
-One image of the best-looking food you can draw in code: "The Golden
-Smash Burger" — a glossy brioche bun with sesame seeds, melted
-cheddar dripping over a char-marked patty, tomato and scalloped
-lettuce, a cup of golden fries, and steam rising off the bun, on a
-cream plate over a dark walnut table, captioned "FRESH OFF THE
-GRILL".
-
-## How it works
-
-`main.py` uses only the Python standard library. It renders the scene
-at 2x supersampling into a 2048x2048 RGB buffer (background gradient
-and radial glow, plate, burger stack, fries, soft steam wisps and the
-caption are all drawn with code: rectangles, discs, ellipses,
-polygons and a 5x7 bitmap font), box-downsamples to 1024x1024, and
-writes the PNG with a hand-rolled encoder. The output is
-deterministic: the same bytes on every run, well under the 1 MiB
-limit.
+The Golden Smash Burger: a golden smash burger with fries, drawn entirely
+in code. A glossy sesame brioche bun, melted cheese dripping over a smashed
+patty, fresh lettuce and tomato, on a wooden board with a pile of golden
+fries in a striped carton, steam rising, and a "FRESH OFF THE GRILL" banner.
 
 ## Run
 
 ```sh
-MAKEFUN_OUTPUT_DIR=/tmp/out python3 main.py
-# writes /tmp/out/entry.png (1024x1024)
+python3 main.py
 ```
 
-## License
-
-MIT. See [LICENSE](LICENSE).
+Writes `entry.png` (1024x1024, deterministic) to `$MAKEFUN_OUTPUT_DIR`,
+or `out/` when unset (the grader's `/output` when present). Pure Python
+standard library only: no dependencies, no network, no embedded image.

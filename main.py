@@ -1,352 +1,163 @@
 #!/usr/bin/env python3
-"""Procedural 1024x1024 PNG for make.fun food-picture-01.
+"""The Golden Smash Burger — a pure-stdlib procedural food picture.
 
-"The Golden Smash Burger" -- a hero shot of a smash burger, drawn
-entirely in code: glossy brioche bun with sesame seeds, melted
-cheddar dripping over a char-marked patty, tomato, scalloped
-lettuce, a cup of golden fries, and steam rising off the bun,
-on a cream plate over a dark walnut table. A small caption,
-"FRESH OFF THE GRILL", sits under the plate.
-
-Pure standard library (math, os, random, struct, zlib, pathlib).
-Fully deterministic: the same bytes on every run (fixed seed for
-the sesame seeds and fry angles). Renders at 2x supersampling
-into a 2048x2048 RGB buffer, box-downsamples to 1024x1024, and
-writes the PNG with a hand-rolled encoder (filter byte 0 per row,
-8-bit colour type 2). Output is well under the 1 MiB limit.
+Draws a golden smash burger with fries on a wooden board, steam rising,
+under a "FRESH OFF THE GRILL" banner, and writes one deterministic
+1024x1024 PNG to /output/entry.png (MAKEFUN_OUTPUT_DIR overrides it
+locally). Standard library only: no PIL, no network, no embedded image.
 """
 
 import math
 import os
-import random
 import struct
 import zlib
-from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Canvas: design space is 1024x1024; the buffer is 2x supersampled.
-# ---------------------------------------------------------------------------
-W = 1024
-S = 2
-IW = W * S  # 2048
-
-buf = bytearray(IW * IW * 3)
-
-# Palette: warm dark backdrop, golden food.
-BG_TOP = (38, 24, 15)
-BG_BOT = (15, 9, 5)
-GLOW = (255, 166, 58)
-TABLE = (44, 29, 17)
-TABLE_LINE = (30, 19, 10)
-TABLE_EDGE = (74, 50, 30)
-PLATE_OUT = (224, 211, 192)
-PLATE_RIM = (226, 214, 196)
-PLATE_IN = (249, 243, 231)
-BUN = (216, 140, 46)
-BUN_RIM = (186, 108, 30)
-BUN_HI = (244, 182, 92)
-BUN_SHADE = (172, 98, 26)
-SESAME = (247, 226, 174)
-SESAME_SH = (186, 120, 40)
-PATTY = (97, 55, 29)
-PATTY_HI = (148, 90, 47)
-PATTY_CHAR = (63, 33, 15)
-PATTY_SH = (70, 38, 18)
-CHEESE = (255, 170, 22)
-CHEESE_HI = (255, 198, 90)
-TOMATO = (216, 54, 40)
-TOMATO_HI = (232, 92, 70)
-LETTUCE = (106, 166, 66)
-LETTUCE_HI = (152, 198, 92)
-BUN_BOT = (207, 133, 45)
-BUN_BOT_HI = (233, 170, 82)
-BUN_BOT_SH = (170, 99, 29)
-FRY = (233, 179, 76)
-FRY_TIP = (196, 138, 48)
-CUP = (196, 42, 38)
-CUP_HI = (216, 58, 50)
-CUP_WHITE = (248, 242, 230)
-STEAM = (255, 248, 238)
-HERB = (90, 150, 70)
-CAPTION = (238, 214, 178)
-RULE = (178, 138, 88)
-BLACK = (0, 0, 0)
-WHITE = (255, 255, 255)
-
-RNG = random.Random(20261114)
+W = H = 1024
 
 
-def _clip(v, lo, hi):
-    return lo if v < lo else hi if v > hi else v
-
-
-def _lerp(c0, c1, t):
-    return (int(c0[0] + (c1[0] - c0[0]) * t),
-            int(c0[1] + (c1[1] - c0[1]) * t),
-            int(c0[2] + (c1[2] - c0[2]) * t))
-
-
-def _ix(v):
-    return int(round(v * S))
-
-
-def span(y, x0, x1, color):
-    """Fill buffer row y from x0 to x1 (buffer px), opaque, fast."""
-    if y < 0 or y >= IW:
-        return
-    x0 = _clip(x0, 0, IW)
-    x1 = _clip(x1, 0, IW)
-    if x1 <= x0:
-        return
-    n = x1 - x0
-    buf[(y * IW + x0) * 3:(y * IW + x1) * 3] = bytes(color) * n
-
-
-def blend_span(y, x0, x1, color, alpha):
-    """Fill buffer row y from x0 to x1, alpha-blended (alpha 0..255)."""
-    if y < 0 or y >= IW or alpha <= 0:
-        return
-    x0 = _clip(x0, 0, IW)
-    x1 = _clip(x1, 0, IW)
-    if x1 <= x0:
-        return
-    if alpha >= 255:
-        span(y, x0, x1, color)
-        return
-    base = (y * IW + x0) * 3
-    n = x1 - x0
-    r, g, b = color
-    ia = 255 - alpha
-    old = buf[base:base + n * 3]
-    out = bytearray(n * 3)
-    for i in range(n):
-        o = i * 3
-        out[o] = (r * alpha + old[o] * ia) // 255
-        out[o + 1] = (g * alpha + old[o + 1] * ia) // 255
-        out[o + 2] = (b * alpha + old[o + 2] * ia) // 255
-    buf[base:base + n * 3] = out
-
-
-def fill_rect(x, y, w, h, color):
-    x0, y0 = _ix(x), _ix(y)
-    x1, y1 = _ix(x + w), _ix(y + h)
-    for yy in range(y0, y1):
-        span(yy, x0, x1, color)
-
-
-def disc(cx, cy, r, color):
-    cx, cy, r = _ix(cx), _ix(cy), _ix(r)
-    r2 = r * r
-    for yy in range(cy - r, cy + r + 1):
-        dy = yy - cy
-        dx = int(math.sqrt(max(0, r2 - dy * dy)))
-        span(yy, cx - dx, cx + dx + 1, color)
-
-
-def blend_disc(cx, cy, r, color, alpha):
-    cx, cy, r = _ix(cx), _ix(cy), _ix(r)
-    r2 = r * r
-    for yy in range(cy - r, cy + r + 1):
-        dy = yy - cy
-        dx = int(math.sqrt(max(0, r2 - dy * dy)))
-        blend_span(yy, cx - dx, cx + dx + 1, color, alpha)
-
-
-def ellipse(cx, cy, rx, ry, color):
-    cx, cy, rx, ry = _ix(cx), _ix(cy), _ix(rx), _ix(ry)
-    for yy in range(cy - ry, cy + ry + 1):
-        dy = (yy - cy) / max(1, ry)
-        dx = int(rx * math.sqrt(max(0.0, 1.0 - dy * dy)))
-        span(yy, cx - dx, cx + dx + 1, color)
-
-
-def blend_ellipse(cx, cy, rx, ry, color, alpha):
-    cx, cy, rx, ry = _ix(cx), _ix(cy), _ix(rx), _ix(ry)
-    for yy in range(cy - ry, cy + ry + 1):
-        dy = (yy - cy) / max(1, ry)
-        dx = int(rx * math.sqrt(max(0.0, 1.0 - dy * dy)))
-        blend_span(yy, cx - dx, cx + dx + 1, color, alpha)
-
-
-def dome(cx, cy, rx, ry, color):
-    """Upper half of an ellipse only (flat bottom edge at y=cy)."""
-    cx, cy, rx, ry = _ix(cx), _ix(cy), _ix(rx), _ix(ry)
-    for yy in range(cy - ry, cy + 1):
-        dy = (yy - cy) / max(1, ry)
-        dx = int(rx * math.sqrt(max(0.0, 1.0 - dy * dy)))
-        span(yy, cx - dx, cx + dx + 1, color)
-
-
-def rrect(x, y, w, h, r, color):
-    fill_rect(x + r, y, w - 2 * r, h, color)
-    fill_rect(x, y + r, w, h - 2 * r, color)
-    disc(x + r, y + r, r, color)
-    disc(x + w - r, y + r, r, color)
-    disc(x + r, y + h - r, r, color)
-    disc(x + w - r, y + h - r, r, color)
-
-
-def polygon(points, color):
-    """Scanline-fill a polygon given in design coordinates."""
-    pts = [(_ix(x), _ix(y)) for x, y in points]
-    ys = [p[1] for p in pts]
-    for yy in range(min(ys), max(ys) + 1):
-        xs = []
-        n = len(pts)
-        for i in range(n):
-            x0, y0 = pts[i]
-            x1, y1 = pts[(i + 1) % n]
-            if (y0 <= yy < y1) or (y1 <= yy < y0):
-                t = (yy - y0) / (y1 - y0)
-                xs.append(int(x0 + t * (x1 - x0)))
-        xs.sort()
-        for i in range(0, len(xs) - 1, 2):
-            span(yy, xs[i], xs[i + 1] + 1, color)
-
-
-def thick_line(x0, y0, x1, y1, width, color):
-    dx, dy = x1 - x0, y1 - y0
-    length = math.hypot(dx, dy)
-    if length == 0:
-        disc(x0, y0, width / 2, color)
-        return
-    nx, ny = -dy / length * width / 2, dx / length * width / 2
-    polygon([(x0 + nx, y0 + ny), (x1 + nx, y1 + ny),
-             (x1 - nx, y1 - ny), (x0 - nx, y0 - ny)], color)
-
-
-def bg_row_color(yy):
-    """Vertical gradient colour at buffer row yy."""
-    return _lerp(BG_TOP, BG_BOT, yy / IW)
-
-
-def background():
-    for yy in range(IW):
-        span(yy, 0, IW, bg_row_color(yy))
-
-
-def glow(cx, cy, rx, ry, color, amax, bands=40):
-    """Warm radial glow over the background, as opaque bands.
-
-    Each band is drawn full-width with the exact final colour for
-    its radius, so no per-pixel blending is needed: the background
-    is a known vertical gradient.
-    """
-    cx, cy, rx, ry = _ix(cx), _ix(cy), _ix(rx), _ix(ry)
-    edges = [1.0 - i / bands for i in range(bands + 1)]
-    for yy in range(cy - ry, cy + ry + 1):
-        dy = (yy - cy) / max(1, ry)
-        chord = int(rx * math.sqrt(max(0.0, 1.0 - dy * dy)))
-        if chord <= 0:
-            continue
-        bgc = bg_row_color(yy)
-        for b in range(len(edges) - 1):
-            f_out, f_in = edges[b], edges[b + 1]
-            f_mid = (f_out + f_in) / 2
-            alpha = amax * (1.0 - f_mid * f_mid)
-            col = _lerp(bgc, color, alpha / 255.0)
-            span(yy, cx - int(chord * f_out), cx + int(chord * f_out) + 1, col)
-
-
-# ---------------------------------------------------------------------------
-# PNG encoder: 8-bit RGB, filter 0 per row, zlib level 9.
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------- PNG out
 def _chunk(kind, data):
-    c = struct.pack(">I", len(data)) + kind + data
-    return c + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    return (struct.pack(">I", len(data)) + kind + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
 
 
-def encode_png(rgb, w, h):
+def write_png(path, px, w, h):
     raw = bytearray()
+    stride = w * 3
     for y in range(h):
         raw.append(0)
-        raw += rgb[y * w * 3:(y + 1) * w * 3]
+        raw += px[y * stride:(y + 1) * stride]
     ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
-    return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr)
-            + _chunk(b"IDAT", zlib.compress(bytes(raw), 9))
-            + _chunk(b"IEND", b""))
+    png = (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr)
+           + _chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+           + _chunk(b"IEND", b""))
+    with open(path, "wb") as f:
+        f.write(png)
+    return len(png)
 
 
-def downsample():
-    out = bytearray(W * W * 3)
-    for y in range(W):
-        for x in range(W):
-            sr = sg = sb = 0
-            for dy in range(S):
-                base = ((y * S + dy) * IW + x * S) * 3
-                for dx in range(S):
-                    i = base + dx * 3
-                    sr += buf[i]
-                    sg += buf[i + 1]
-                    sb += buf[i + 2]
-            o = (y * W + x) * 3
-            out[o] = sr // (S * S)
-            out[o + 1] = sg // (S * S)
-            out[o + 2] = sb // (S * S)
-    return out
+# ---------------------------------------------------------------- canvas
+class Canvas:
+    def __init__(self, w, h):
+        self.w, self.h = w, h
+        self.px = bytearray(w * h * 3)
 
-# ---------------------------------------------------------------------------
-# 5x7 bitmap font. 7 rows of 5 bits, '1' = filled.
-# ---------------------------------------------------------------------------
+    def blend(self, x, y, r, g, b, a=255):
+        if a <= 0 or x < 0 or y < 0 or x >= self.w or y >= self.h:
+            return
+        i = (y * self.w + x) * 3
+        if a >= 255:
+            self.px[i] = r
+            self.px[i + 1] = g
+            self.px[i + 2] = b
+            return
+        inv = 255 - a
+        self.px[i] = (r * a + self.px[i] * inv) // 255
+        self.px[i + 1] = (g * a + self.px[i + 1] * inv) // 255
+        self.px[i + 2] = (b * a + self.px[i + 2] * inv) // 255
+
+    def hline(self, x0, x1, y, r, g, b, a=255):
+        if y < 0 or y >= self.h:
+            return
+        x0 = max(0, x0)
+        x1 = min(self.w - 1, x1)
+        for x in range(x0, x1 + 1):
+            self.blend(x, y, r, g, b, a)
+
+    def vgrad(self, top, bottom):
+        for y in range(self.h):
+            t = y / (self.h - 1)
+            r = int(top[0] + (bottom[0] - top[0]) * t)
+            g = int(top[1] + (bottom[1] - top[1]) * t)
+            b = int(top[2] + (bottom[2] - top[2]) * t)
+            self.hline(0, self.w - 1, y, r, g, b)
+
+    def fill_rect(self, x0, y0, x1, y1, color, a=255):
+        for y in range(max(0, y0), min(self.h, y1 + 1)):
+            self.hline(x0, x1, y, *color, a)
+
+    def fill_circle(self, cx, cy, rad, color, a=255):
+        for dy in range(-rad, rad + 1):
+            dx = int(math.sqrt(max(0, rad * rad - dy * dy)))
+            self.hline(cx - dx, cx + dx, cy + dy, *color, a)
+
+    def fill_ellipse(self, cx, cy, rx, ry, color, a=255, y_max=None):
+        for dy in range(-ry, ry + 1):
+            y = cy + dy
+            if y_max is not None and y > y_max:
+                continue
+            t = 1.0 - (dy * dy) / float(ry * ry)
+            dx = int(rx * math.sqrt(max(0.0, t)))
+            self.hline(cx - dx, cx + dx, y, *color, a)
+
+    def fill_polygon(self, pts, color, a=255):
+        ys = [p[1] for p in pts]
+        y0, y1 = max(0, min(ys)), min(self.h - 1, max(ys))
+        n = len(pts)
+        for y in range(y0, y1 + 1):
+            xs = []
+            for i in range(n):
+                x0, ya = pts[i]
+                x1, yb = pts[(i + 1) % n]
+                if ya == yb:
+                    continue
+                if (ya <= y < yb) or (yb <= y < ya):
+                    xs.append(x0 + (y - ya) * (x1 - x0) / (yb - ya))
+            xs.sort()
+            for j in range(0, len(xs) - 1, 2):
+                self.hline(int(xs[j]), int(xs[j + 1]), y, *color, a)
+
+    def round_rect(self, x0, y0, x1, y1, rad, color, a=255):
+        self.fill_rect(x0 + rad, y0, x1 - rad, y1, color, a)
+        self.fill_rect(x0, y0 + rad, x1, y1 - rad, color, a)
+        for cx, cy in ((x0 + rad, y0 + rad), (x1 - rad, y0 + rad),
+                       (x0 + rad, y1 - rad), (x1 - rad, y1 - rad)):
+            self.fill_circle(cx, cy, rad, color, a)
+
+    def thick_line(self, x0, y0, x1, y1, rad, color, a=255):
+        steps = max(abs(x1 - x0), abs(y1 - y0), 1) + 1
+        for i in range(steps):
+            t = i / (steps - 1)
+            self.fill_circle(int(x0 + (x1 - x0) * t),
+                             int(y0 + (y1 - y0) * t), rad, color, a)
+
+    def rot_rect(self, cx, cy, w, h, deg, color, a=255):
+        th = math.radians(deg)
+        c, s = math.cos(th), math.sin(th)
+        hw, hh = w / 2.0, h / 2.0
+        corners = []
+        for dx, dy in ((-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)):
+            corners.append((int(cx + dx * c - dy * s),
+                            int(cy + dx * s + dy * c)))
+        self.fill_polygon(corners, color, a)
+
+
+# ---------------------------------------------------------------- 5x7 font
 FONT = {
-    "A": ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
-    "B": ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
-    "C": ["01110", "10001", "10000", "10000", "10000", "10001", "01110"],
-    "D": ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
-    "E": ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
-    "F": ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
-    "G": ["01110", "10001", "10000", "10111", "10001", "10001", "01111"],
-    "H": ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
-    "I": ["01110", "00100", "00100", "00100", "00100", "00100", "01110"],
-    "J": ["00111", "00010", "00010", "00010", "00010", "10010", "01100"],
-    "K": ["10001", "10010", "10100", "11000", "10100", "10010", "10001"],
-    "L": ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
-    "M": ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
-    "N": ["10001", "11001", "10101", "10011", "10001", "10001", "10001"],
-    "O": ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
-    "P": ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
-    "Q": ["01110", "10001", "10001", "10001", "10101", "10010", "01101"],
+    "F": ["11111", "10000", "11110", "10000", "10000", "10000", "10000"],
     "R": ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
+    "E": ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
     "S": ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
+    "H": ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
+    "O": ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
     "T": ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
-    "U": ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
-    "V": ["10001", "10001", "10001", "10001", "10001", "01010", "00100"],
-    "W": ["10001", "10001", "10001", "10101", "10101", "10101", "01010"],
-    "X": ["10001", "10001", "01010", "00100", "01010", "10001", "10001"],
-    "Y": ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
-    "Z": ["11111", "00001", "00010", "00100", "01000", "10000", "11111"],
-    "0": ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
-    "1": ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
-    "2": ["01110", "10001", "00001", "00110", "01000", "10000", "11111"],
-    "3": ["11111", "00010", "00100", "00010", "00001", "10001", "01110"],
-    "4": ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
-    "5": ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
-    "6": ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
-    "7": ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
-    "8": ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
-    "9": ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
+    "G": ["01110", "10001", "10000", "10111", "10001", "10001", "01111"],
+    "I": ["11111", "00100", "00100", "00100", "00100", "00100", "11111"],
+    "L": ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
     " ": ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
-    ".": ["00000", "00000", "00000", "00000", "00000", "01100", "01100"],
-    ",": ["00000", "00000", "00000", "00000", "01100", "00100", "01000"],
-    ":": ["00000", "01100", "01100", "00000", "01100", "01100", "00000"],
-    "!": ["00100", "00100", "00100", "00100", "00100", "00000", "00100"],
-    "?": ["01110", "10001", "00001", "00110", "00100", "00000", "00100"],
-    "'": ["00100", "00100", "01000", "00000", "00000", "00000", "00000"],
-    "-": ["00000", "00000", "00000", "01110", "00000", "00000", "00000"],
-    "*": ["00000", "10101", "01110", "10101", "00000", "00000", "00000"],
 }
 
 
-def draw_text(text, x, y, scale, color):
-    """Draw text; one font pixel is a scale x scale design-px block."""
+def draw_text(cv, text, x, y, scale, color):
     cx = x
     for ch in text:
-        glyph = FONT.get(ch)
-        if glyph:
-            for r, row in enumerate(glyph):
-                for c, bit in enumerate(row):
-                    if bit == "1":
-                        fill_rect(cx + c * scale, y + r * scale, scale, scale, color)
+        glyph = FONT.get(ch, FONT[" "])
+        for row in range(7):
+            for col in range(5):
+                if glyph[row][col] == "1":
+                    cv.fill_rect(cx + col * scale, y + row * scale,
+                                 cx + col * scale + scale - 1,
+                                 y + row * scale + scale - 1, color)
         cx += 6 * scale
 
 
@@ -354,156 +165,195 @@ def text_width(text, scale):
     return len(text) * 6 * scale - scale
 
 
-def draw_text_centered(text, y, scale, color, cx=W // 2):
-    draw_text(text, cx - text_width(text, scale) // 2, y, scale, color)
+# ---------------------------------------------------------------- palette
+BG_TOP = (64, 40, 26)
+BG_BOT = (26, 15, 9)
+GLOW = (255, 170, 60)
+BOARD = (146, 96, 54)
+BOARD_DARK = (110, 70, 38)
+BOARD_EDGE = (88, 56, 30)
+GRAIN = (96, 62, 34)
+CARTON = (178, 39, 46)
+CARTON_DARK = (140, 28, 34)
+STRIPE = (245, 235, 220)
+FRY = (242, 178, 52)
+FRY_EDGE = (217, 143, 31)
+FRY_TIP = (250, 205, 90)
+BUN = (234, 169, 79)
+BUN_LIGHT = (247, 196, 110)
+BUN_SHADE = (205, 130, 44)
+BUN_BOT = (226, 160, 74)
+BUN_BOT_SHADE = (181, 119, 46)
+PATTY = (74, 44, 23)
+PATTY_DARK = (52, 30, 15)
+PATTY_HI = (96, 60, 32)
+CHEESE = (255, 157, 27)
+CHEESE_LIGHT = (255, 183, 70)
+TOMATO = (217, 56, 43)
+TOMATO_LIGHT = (232, 90, 72)
+LETTUCE = (124, 179, 66)
+LETTUCE_DARK = (93, 143, 46)
+SESAME = (255, 230, 168)
+SESAME_EDGE = (214, 170, 90)
+BANNER = (168, 35, 42)
+BANNER_DARK = (120, 22, 28)
+CREAM = (255, 243, 214)
+SHADOW = (0, 0, 0)
 
 
-# ---------------------------------------------------------------------------
-# Scene: the golden smash burger.
-# ---------------------------------------------------------------------------
-def draw_table():
-    fill_rect(0, 700, W, W - 700, TABLE)
-    fill_rect(0, 700, W, 3, TABLE_EDGE)
-    for y in (800, 880, 960):
-        fill_rect(0, y, W, 3, TABLE_LINE)
+# ---------------------------------------------------------------- scene
+def draw_background(cv):
+    cv.vgrad(BG_TOP, BG_BOT)
+    cv.fill_circle(430, 620, 330, GLOW, 18)
+    cv.fill_circle(430, 620, 220, GLOW, 22)
+    bokeh = [
+        (120, 180, 55, (255, 190, 90), 26), (900, 150, 70, (255, 170, 70), 22),
+        (950, 420, 48, (255, 200, 110), 24), (80, 500, 40, (255, 180, 80), 20),
+        (850, 900, 60, (255, 170, 70), 18), (150, 880, 45, (255, 190, 100), 20),
+        (700, 120, 38, (255, 200, 120), 24), (250, 300, 30, (255, 185, 95), 18),
+        (780, 300, 26, (255, 195, 110), 20), (950, 700, 34, (255, 175, 75), 18),
+        (60, 760, 30, (255, 190, 100), 16), (600, 950, 50, (255, 180, 85), 16),
+    ]
+    for x, y, r, col, a in bokeh:
+        cv.fill_circle(x, y, r, col, a)
 
 
-def draw_plate():
-    blend_ellipse(512, 752, 350, 36, BLACK, 100)
-    ellipse(512, 652, 338, 102, PLATE_OUT)
-    ellipse(512, 650, 306, 88, PLATE_RIM)
-    ellipse(512, 650, 292, 80, PLATE_IN)
+def draw_board(cv):
+    cv.round_rect(90, 700, 934, 950, 28, BOARD_EDGE)
+    cv.round_rect(96, 704, 928, 944, 24, BOARD)
+    cv.hline(110, 920, 712, 172, 118, 68, 160)
+    for gy in (760, 830, 890, 920):
+        for x in range(120, 920, 14):
+            wob = int(3 * math.sin(x * 0.05 + gy))
+            cv.blend(x, gy + wob, *GRAIN, 70)
+    cv.fill_ellipse(430, 826, 240, 26, SHADOW, 70)
 
 
-def draw_fries():
-    # Golden sticks, tops sticking out of the cup at slight angles.
-    sticks = []
-    for i in range(11):
-        bx = 780 + i * 9
-        top_y = 518 + RNG.randint(0, 36)
-        lean = RNG.randint(-16, 14)
-        sticks.append((bx, top_y, lean))
-    for bx, top_y, lean in sticks:
-        thick_line(bx, 648, bx + lean, top_y, 19, FRY)
-        disc(bx + lean, top_y, 8, FRY_TIP)
-    # Cup: red trapezoid with white stripes and a rim.
-    polygon([(762, 616), (878, 616), (864, 742), (776, 742)], CUP)
-    polygon([(792, 616), (812, 616), (808, 742), (796, 742)], CUP_WHITE)
-    polygon([(832, 616), (852, 616), (848, 742), (836, 742)], CUP_WHITE)
-    rrect(758, 606, 124, 18, 6, CUP_HI)
+def draw_fries(cv):
+    sticks = [
+        (712, 600, -14), (748, 580, -6), (782, 572, 2), (818, 580, 8),
+        (852, 598, 14), (730, 620, -10), (790, 612, 4), (838, 622, 12),
+        (762, 636, -2), (812, 634, 6),
+    ]
+    for cx, cy, ang in sticks:
+        cv.rot_rect(cx, cy, 30, 118, ang, FRY_EDGE)
+        cv.rot_rect(cx, cy, 24, 112, ang, FRY)
+        cv.rot_rect(cx, cy - 44, 24, 16, ang, FRY_TIP)
+    carton = [(690, 786), (880, 786), (858, 640), (712, 640)]
+    cv.fill_polygon(carton, CARTON_DARK)
+    inner = [(700, 780), (870, 780), (850, 648), (720, 648)]
+    cv.fill_polygon(inner, CARTON)
+    for sx in (736, 776, 816):
+        cv.fill_polygon([(sx, 780), (sx + 18, 780), (sx + 12, 648),
+                         (sx - 4, 648)], STRIPE, 235)
+    cv.fill_polygon([(700, 780), (870, 780), (866, 764), (704, 764)],
+                    CARTON_DARK)
 
 
-def draw_burger():
-    cx = 512
-    # Bottom bun (patty covers its top edge).
-    rrect(296, 580, 432, 64, 24, BUN_BOT)
-    fill_rect(306, 586, 412, 10, BUN_BOT_HI)
-    fill_rect(296, 632, 432, 12, BUN_BOT_SH)
-    # Patty with char marks.
-    rrect(284, 524, 456, 60, 20, PATTY)
-    fill_rect(292, 524, 440, 10, PATTY_HI)
-    for sx in (330, 408, 486, 564, 642):
-        fill_rect(sx, 534, 12, 48, PATTY_CHAR)
-    fill_rect(284, 574, 456, 10, PATTY_SH)
-    # Tomato slice peeking out.
-    ellipse(cx, 520, 242, 22, TOMATO)
-    ellipse(480, 512, 120, 8, TOMATO_HI)
-    # Melted cheddar, dripping over the patty.
-    fill_rect(290, 496, 444, 28, CHEESE)
-    fill_rect(298, 500, 428, 8, CHEESE_HI)
-    for dx, dw, dl in ((340, 26, 556), (440, 22, 548),
-                       (560, 28, 562), (668, 22, 544)):
-        fill_rect(dx, 496, dw, dl - 496, CHEESE)
-        disc(dx + dw // 2, dl, dw // 2, CHEESE)
-    # Scalloped lettuce.
-    fill_rect(262, 476, 500, 26, LETTUCE)
-    for lx in range(278, 747, 32):
-        disc(lx, 502, 15, LETTUCE)
-    for lx in range(294, 731, 32):
-        disc(lx, 496, 8, LETTUCE_HI)
-    # Top bun: golden dome with rim, shade, sheen and sesame.
-    dome(cx, 484, 238, 146, BUN_RIM)
-    dome(cx, 482, 234, 144, BUN)
-    blend_ellipse(512, 512, 225, 55, BUN_SHADE, 80)
-    blend_ellipse(462, 408, 150, 82, BUN_HI, 85)
-    blend_ellipse(470, 400, 120, 55, WHITE, 46)
-    seeds = []
-    while len(seeds) < 16:
-        sx = RNG.randint(350, 674)
-        sy = RNG.randint(350, 470)
-        if ((sx - cx) / 225.0) ** 2 + ((sy - 478) / 135.0) ** 2 < 0.62:
-            seeds.append((sx, sy))
+def draw_burger(cv):
+    cx = 430
+    # bottom bun
+    cv.fill_ellipse(cx, 776, 218, 56, BUN_BOT)
+    cv.fill_ellipse(cx, 802, 196, 26, BUN_BOT_SHADE, 200)
+    # patty with bumpy edge and char marks
+    cv.round_rect(212, 702, 648, 774, 18, PATTY)
+    for bx in range(234, 636, 28):
+        cv.fill_circle(bx, 772, 10, PATTY)
+    cv.fill_rect(234, 706, 626, 714, PATTY_HI, 120)
+    for mx in (280, 360, 470, 560):
+        cv.fill_rect(mx, 726, mx + 26, 736, PATTY_DARK, 160)
+    # cheese, wavy with drips
+    cheese = [(222, 686), (638, 686), (638, 708), (620, 716), (608, 736),
+              (594, 712), (562, 716), (550, 734), (536, 712), (478, 716),
+              (466, 738), (452, 712), (392, 716), (380, 732), (366, 712),
+              (312, 716), (300, 734), (286, 712), (222, 708)]
+    cv.fill_polygon(cheese, CHEESE)
+    cv.fill_polygon([(222, 686), (638, 686), (638, 694), (222, 694)],
+                    CHEESE_LIGHT, 200)
+    # tomato
+    cv.fill_ellipse(cx, 674, 192, 26, TOMATO)
+    cv.fill_ellipse(cx, 672, 160, 16, TOMATO_LIGHT, 160)
+    # lettuce, scalloped edge
+    pts = [(238, 650), (622, 650)]
+    x = 622
+    down = True
+    while x > 238:
+        pts.append((x, 674 if down else 656))
+        down = not down
+        x -= 14
+    pts.append((238, 656))
+    cv.fill_polygon(pts, LETTUCE)
+    for lx in range(260, 610, 34):
+        cv.fill_circle(lx, 668, 8, LETTUCE_DARK, 120)
+    # top bun dome (clipped at the lettuce line)
+    cv.fill_ellipse(cx, 634, 240, 134, BUN, y_max=652)
+    cv.fill_ellipse(360, 570, 126, 48, BUN_LIGHT, 110, y_max=652)
+    cv.fill_ellipse(cx, 650, 236, 18, BUN_SHADE, 160, y_max=652)
+    seeds = [(330, 550), (390, 530), (450, 522), (510, 535), (560, 558),
+             (300, 590), (360, 595), (470, 595), (540, 600), (410, 565),
+             (500, 570), (340, 620), (580, 610), (420, 610)]
     for sx, sy in seeds:
-        ellipse(sx + 2, sy + 3, 9, 5, SESAME_SH)
-        ellipse(sx, sy, 9, 5, SESAME)
+        cv.fill_ellipse(sx, sy, 9, 5, SESAME_EDGE)
+        cv.fill_ellipse(sx, sy - 1, 8, 4, SESAME)
 
 
-def soft_wisp(cx, y_top, y_bot, phase, width, amax):
-    """A smooth vertical wisp: per buffer row, annulus bands of
-    alpha-blended spans, so no disc edge ever shows."""
-    edges = [1.0, 0.8, 0.6, 0.4, 0.2, 0.0]
-    for yy in range(_ix(y_top), _ix(y_bot) + 1):
-        dy = yy / S
-        s = (y_bot - dy) / max(1.0, y_bot - y_top)  # 0 bottom, 1 top
-        ccx = _ix(cx + 26 * math.sin(s * 3.0 + phase))
-        w = _ix(width * (0.8 + 0.4 * s))
-        env = math.sin(math.pi * (0.2 + 0.8 * s))
-        if env <= 0.01:
-            continue
-        for b in range(len(edges) - 1):
-            f_out, f_in = edges[b], edges[b + 1]
-            f_mid = (f_out + f_in) / 2
-            alpha = int(amax * env * (1.0 - f_mid * f_mid))
-            if alpha <= 0:
-                continue
-            xo = int(w * f_out)
-            xi = int(w * f_in)
-            blend_span(yy, ccx - xo, ccx - xi, STEAM, alpha)
-            blend_span(yy, ccx + xi, ccx + xo, STEAM, alpha)
+def draw_steam(cv):
+    for cx, phase in ((350, 0.0), (430, 1.4), (510, 2.6)):
+        for t in range(15):
+            y = 500 - t * 9
+            x = int(cx + 14 * math.sin(t * 0.7 + phase))
+            r = 11 + (t % 3)
+            cv.fill_circle(x, y, r, (255, 255, 255), 34 + 8 * (t % 3))
 
 
-def draw_steam():
-    for cx, phase in ((440, 0.0), (512, 1.3), (584, 2.6)):
-        soft_wisp(cx, 150, 332, phase, 30, 26)
-    for cx, phase in ((800, 0.4), (842, 1.9)):
-        soft_wisp(cx, 440, 522, phase, 20, 20)
-
-
-def draw_garnish():
-    for gx, gy, grx in ((300, 700, 14), (720, 712, 12), (640, 726, 10)):
-        ellipse(gx, gy, grx, 6, HERB)
-    for gx, gy in ((360, 716), (700, 690), (420, 728)):
-        ellipse(gx, gy, 5, 3, SESAME)
-
-
-def draw_caption():
+def draw_banner(cv):
+    cv.round_rect(144, 50, 880, 140, 10, BANNER_DARK)
+    cv.round_rect(150, 56, 874, 134, 10, BANNER)
+    cv.fill_polygon([(150, 56), (176, 56), (176, 134), (150, 134)],
+                    BANNER_DARK, 120)
+    cv.fill_polygon([(874, 56), (848, 56), (848, 134), (874, 134)],
+                    BANNER_DARK, 120)
     text = "FRESH OFF THE GRILL"
-    draw_text_centered(text, 930, 4, CAPTION)
-    fill_rect(190, 942, 70, 4, RULE)
-    fill_rect(764, 942, 70, 4, RULE)
+    tw = text_width(text, 5)
+    draw_text(cv, text, (W - tw) // 2, 79, 5, CREAM)
 
 
-def render():
-    background()
-    glow(512, 440, 470, 330, GLOW, 36)
-    draw_table()
-    draw_plate()
-    draw_fries()
-    draw_burger()
-    draw_steam()
-    draw_garnish()
-    draw_caption()
+def draw_garnish(cv):
+    # dipping sauce bowl on the board, left of the burger
+    cv.fill_ellipse(180, 852, 48, 22, (245, 235, 220))
+    cv.fill_ellipse(180, 848, 40, 16, (232, 90, 72))
+    cv.fill_ellipse(172, 844, 22, 8, (240, 120, 100), 180)
+    for sx, sy in ((180, 860), (260, 900), (880, 860), (820, 905),
+                   (620, 880), (240, 760), (700, 850), (300, 905),
+                   (660, 920), (900, 800)):
+        cv.fill_ellipse(sx, sy, 6, 4, SESAME)
+    for hx, hy in ((300, 830), (560, 850), (860, 800), (200, 830)):
+        cv.fill_rect(hx, hy, hx + 10, hy + 4, LETTUCE_DARK, 200)
+    for cx, cy in ((350, 900), (520, 920), (760, 880), (880, 920)):
+        cv.fill_circle(cx, cy, 4, (120, 78, 40), 200)
+
+
+def build():
+    cv = Canvas(W, H)
+    draw_background(cv)
+    draw_board(cv)
+    draw_fries(cv)
+    draw_burger(cv)
+    draw_steam(cv)
+    draw_banner(cv)
+    draw_garnish(cv)
+    return cv
 
 
 def main():
-    render()
-    rgb = downsample()
-    png = encode_png(rgb, W, W)
-    outdir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-    outdir.mkdir(parents=True, exist_ok=True)
-    out = outdir / "entry.png"
-    out.write_bytes(png)
-    print(f"wrote {out} ({len(png)} bytes, {W}x{W})")
+    outdir = os.environ.get("MAKEFUN_OUTPUT_DIR")
+    if not outdir:
+        outdir = "/output" if os.path.isdir("/output") else "out"
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, "entry.png")
+    cv = build()
+    size = write_png(path, cv.px, W, H)
+    print("wrote %s (%d bytes, %dx%d)" % (path, size, W, H))
 
 
 if __name__ == "__main__":
